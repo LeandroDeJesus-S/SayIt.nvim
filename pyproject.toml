@@ -1,0 +1,14 @@
+[project]
+name = "sayit"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11.11"
+dependencies = [
+    "kokoro-onnx",
+    "sounddevice>=0.5.5",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "soundfile>=0.12.0",
+    "python-multipart>=0.0.12",
+]
