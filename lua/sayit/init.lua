@@ -74,6 +74,9 @@ local function download_voices(path, url, callback)
 end
 
 local server_job_id = nil
+local server_starting = false
+local server_callbacks = {}
+local config = nil
 
 local function stop_server()
     if server_job_id then
@@ -119,6 +122,67 @@ local function start_server(opts)
     })
 end
 
+local function wait_for_server(host, port, callback)
+    local url = string.format("http://%s:%d/", host, port)
+    local timer = vim.loop.new_timer()
+    local attempts = 0
+    local max_attempts = 50 -- 5 seconds total
+
+    timer:start(0, 100, function()
+        vim.schedule(function()
+            local res = vim.fn.system({ "curl", "-s", url })
+            if res:match("healthy") then
+                timer:stop()
+                timer:close()
+                callback()
+            else
+                attempts = attempts + 1
+                if attempts >= max_attempts then
+                    timer:stop()
+                    timer:close()
+                    vim.notify("Server failed to start in time", vim.log.levels.ERROR)
+                    server_starting = false
+                    server_callbacks = {}
+                end
+            end
+        end)
+    end)
+end
+
+local function ensure_server_started(callback)
+    if server_job_id then
+        callback()
+        return
+    end
+
+    table.insert(server_callbacks, callback)
+    if server_starting then
+        return
+    end
+    server_starting = true
+
+    local function run_server()
+        start_server(config)
+        wait_for_server(config.server.host, config.server.port, function()
+            server_starting = false
+            for _, cb in ipairs(server_callbacks) do
+                cb()
+            end
+            server_callbacks = {}
+        end)
+    end
+
+    if config.kokoro.auto_download then
+        download_model(config.kokoro.model_path, config.kokoro.model_url, function()
+            download_voices(config.kokoro.voices_path, config.kokoro.voices_url, function()
+                run_server()
+            end)
+        end)
+    else
+        run_server()
+    end
+end
+
 local default_opts = {
     server = {
         host = "localhost",
@@ -161,76 +225,65 @@ end
 return {
     setup = function(opts)
         opts = opts or {}
-        opts = vim.tbl_deep_extend("force", default_opts, opts)
+        config = vim.tbl_deep_extend("force", default_opts, opts)
 
         -- 1. check dependencies
         if not check_executables(required_executables) then
             return
         end
 
-        -- 2. download model and voices if auto_download is true
-        if opts.kokoro.auto_download then
-            download_model(opts.kokoro.model_path, opts.kokoro.model_url, function()
-                download_voices(opts.kokoro.voices_path, opts.kokoro.voices_url, function()
-                    -- 3. start the server (only after downloads if auto_download is true)
-                    start_server(opts)
-                end)
-            end)
-        else
-            -- 3. start the server immediately
-            start_server(opts)
+        -- 2. setup the keymaps
+        if config.keymaps.speak_selection then
+            vim.keymap.set("v", config.keymaps.speak_selection, ":SayIt<CR>", { desc = "Speak selection" })
         end
-
-        -- 4. setup the keymaps
-        if opts.keymaps.speak_selection then
-            vim.keymap.set("v", opts.keymaps.speak_selection, ":SayIt<CR>", { desc = "Speak selection" })
-        end
-        if opts.keymaps.speak_buffer then
-            vim.keymap.set("n", opts.keymaps.speak_buffer, ":%SayIt<CR>", { desc = "Speak buffer" })
+        if config.keymaps.speak_buffer then
+            vim.keymap.set("n", config.keymaps.speak_buffer, ":%SayIt<CR>", { desc = "Speak buffer" })
         end
 
         vim.api.nvim_create_user_command("ShutUp", stop_speaking, { desc = "Stop speaking" })
 
         vim.api.nvim_create_user_command("SayIt", function(args)
-            stop_speaking()
-            local lines = get_selection(args)
-            local text = table.concat(lines, "\n")
+            ensure_server_started(function()
+                stop_speaking()
+                local lines = get_selection(args)
+                local text = table.concat(lines, "\n")
 
-            if not text or text == "" then
-                vim.notify("No text to speak", vim.log.levels.WARN)
-                return
-            end
+                if not text or text == "" then
+                    vim.notify("No text to speak", vim.log.levels.WARN)
+                    return
+                end
 
-            local json_payload = vim.fn.json_encode({
-                text = text,
-                voice = opts.kokoro.voice,
-                speed = opts.kokoro.speed,
-                lang = opts.kokoro.lang,
-            })
+                local json_payload = vim.fn.json_encode({
+                    text = text,
+                    voice = config.kokoro.voice,
+                    speed = config.kokoro.speed,
+                    lang = config.kokoro.lang,
+                })
 
-            local url = string.format("http://%s:%d/tts", opts.server.host, opts.server.port)
-            -- We use a temporary file for the payload to avoid shell escape issues with large text
-            local tmp_json = vim.fn.tempname() .. ".json"
-            local f = io.open(tmp_json, "w")
-            if f then
-                f:write(json_payload)
-                f:close()
-            end
+                local url = string.format("http://%s:%d/tts", config.server.host, config.server.port)
+                -- We use a temporary file for the payload to avoid shell escape issues with large text
+                local tmp_json = vim.fn.tempname() .. ".json"
+                local f = io.open(tmp_json, "w")
+                if f then
+                    f:write(json_payload)
+                    f:close()
+                end
 
-            local cmd = string.format(
-                "curl -N -s -X POST %s -H 'Content-Type: application/json' -d @%s | mpv --no-terminal --profile=low-latency --cache=no -",
-                url,
-                tmp_json
-            )
+                local cmd = string.format(
+                    "curl -N -s -X POST %s -H 'Content-Type: application/json' -d @%s | mpv --no-terminal --profile=low-latency --cache=no -",
+                    url,
+                    tmp_json
+                )
 
-            vim.notify("Speaking...", vim.log.levels.INFO)
+                vim.notify("Speaking...", vim.log.levels.INFO)
 
-            speak_job_id = vim.fn.jobstart({ "sh", "-c", cmd }, {
-                on_exit = function()
-                    os.remove(tmp_json)
-                    speak_job_id = nil
-                end,
-            })
+                speak_job_id = vim.fn.jobstart({ "sh", "-c", cmd }, {
+                    on_exit = function()
+                        os.remove(tmp_json)
+                        speak_job_id = nil
+                    end,
+                })
+            end)
         end, { range = true, desc = "Stream TTS to speak text" })
     end,
 }
